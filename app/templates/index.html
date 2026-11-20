@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>计费结算两阶段提交 · 运维台</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --blue:#0969da; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: var(--bg); color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header .fp { font-size: 13px; color: #d0d7de; margin-top: 4px; }
+  main { max-width: 1180px; margin: 20px auto; padding: 0 16px; display: grid; gap: 16px; }
+  .card { background: #fff; border: 1px solid var(--bd); border-radius: 8px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--bd); }
+  th { background: var(--bg); font-weight: 600; }
+  .empty { color: #656d76; font-style: italic; }
+  input, button { font: inherit; padding: 7px 10px; border: 1px solid var(--bd); border-radius: 6px; }
+  input { width: 100%; }
+  button { background: var(--blue); color: #fff; border-color: var(--blue); cursor: pointer; }
+  button.secondary { background: #fff; color: var(--blue); }
+  button:disabled { opacity: .55; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input { flex: 1; }
+  pre { background: var(--bg); border: 1px solid var(--bd); border-radius: 6px;
+        padding: 10px; font-size: 12px; overflow: auto; max-height: 340px; margin: 8px 0 0; }
+  .msg { padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+  .msg.committed { background: #dafbe1; border: 1px solid var(--ok); color: var(--ok); }
+  .msg.aborted   { background: #fff8c5; border: 1px solid var(--warn); color: var(--warn); }
+  .msg.held, .msg.duplicate { background: #ffebe9; border: 1px solid var(--err); color: var(--err); }
+  .msg.noop, .msg.info { background: #ddf4ff; border: 1px solid var(--blue); color: var(--blue); }
+  .msg.error { background: #ffebe9; border: 1px solid var(--err); color: var(--err); }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+  .pill.prepared { background: #fff1e5; color: #bc4c00; border: 1px solid #bc4c00; }
+  label { font-size: 12px; color: #656d76; display: block; margin-bottom: 4px; }
+  .muted { color: #656d76; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>计费结算两阶段提交 · 运维台</h1>
+  <div class="fp">当前故障注入点 FAILPOINT：<b id="fp">{{ failpoint }}</b>
+    （可选：{{ failpoints | join(' / ') }}）— 由进程环境变量控制</div>
+</header>
+<main>
+  <section class="card">
+    <h2>① 两库残留预备事务（pg_prepared_xacts）</h2>
+    <div class="grid2">
+      <div><h3 style="margin:4px 0 8px;font-size:13px">扣款库 debit</h3>
+        <table id="tbl-debit"><thead><tr><th>GID</th><th>属主</th><th>库名</th><th>PREPARE 时间</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div><h3 style="margin:4px 0 8px;font-size:13px">入账库 credit</h3>
+        <table id="tbl-credit"><thead><tr><th>GID</th><th>属主</th><th>库名</th><th>PREPARE 时间</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+    <p class="muted" style="margin-top:10px"><button class="secondary" onclick="refreshState()">刷新预备事务</button>
+      页面每 5 秒自动刷新一次</p>
+  </section>
+
+  <section class="card">
+    <h2>② 发起一笔结算演练（按当前故障点决定是否中断）</h2>
+    <div class="row">
+      <div style="flex:1"><label>结算号</label><input id="start-no" placeholder="例如 S20261120001"></div>
+      <div style="flex:1"><label>金额</label><input id="start-amt" value="100.00"></div>
+      <div style="align-self:flex-end"><button onclick="startSettle()">发起两阶段结算</button></div>
+    </div>
+    <div id="start-msg"></div>
+    <p class="muted" style="margin-top:8px">若进程在故障点退出，本页 API 将暂时无响应；重启进程后到第 ③ 步按结算号恢复。</p>
+  </section>
+
+  <section class="card">
+    <h2>③ 按结算号查看协调日志并恢复中断结算</h2>
+    <div class="row">
+      <div style="flex:1"><label>结算号</label><input id="rec-no" placeholder="例如 S20261120001"></div>
+      <div style="align-self:flex-end">
+        <button class="secondary" onclick="viewLogs()">查看日志</button>
+        <button onclick="recover()">恢复此结算</button>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:10px">
+      <div><b style="font-size:13px">扣款库协调日志 xact_log</b><pre id="log-debit" class="empty">（输入结算号后查询）</pre></div>
+      <div><b style="font-size:13px">入账库协调日志 xact_log</b><pre id="log-credit" class="empty">（输入结算号后查询）</pre></div>
+    </div>
+    <div id="rec-msg"></div>
+  </section>
+</main>
+
+<script>
+function showMsg(el, text, cls) {
+  el.innerHTML = '<div class="msg ' + cls + '">' + text + '</div>';
+}
+async function refreshState() {
+  try {
+    const r = await fetch('/api/state'); const d = await r.json();
+    document.getElementById('fp').textContent = d.failpoint;
+    for (const key of ['debit', 'credit']) {
+      const tb = document.querySelector('#tbl-' + key + ' tbody');
+      const rows = d.databases[key].prepared;
+      if (!rows.length) {
+        tb.innerHTML = '<tr><td colspan="4" class="empty">无残留预备事务</td></tr>';
+      } else {
+        tb.innerHTML = rows.map(x =>
+          '<tr><td><span class="pill prepared">' + x.gid + '</span></td><td>' + x.owner +
+          '</td><td>' + x.dbname + '</td><td>' + x.prepared + '</td></tr>').join('');
+      }
+    }
+  } catch (e) { /* coordinator may be restarting */ }
+}
+async function startSettle() {
+  const no = document.getElementById('start-no').value.trim();
+  const amt = document.getElementById('start-amt').value.trim();
+  const msg = document.getElementById('start-msg');
+  if (!no) { showMsg(msg, '请填写结算号', 'error'); return; }
+  const body = new URLSearchParams({settlement_no: no, amount: amt});
+  try {
+    const r = await fetch('/api/settlement/start', {method: 'POST', body});
+    const d = await r.json();
+    if (d.ok) showMsg(msg, '结算 ' + no + ' 已完整走完全部两阶段提交流程。', 'committed');
+    else showMsg(msg, '发起被拒：' + d.error, 'error');
+  } catch (e) {
+    showMsg(msg, '请求中断 —— 协调进程很可能已按故障点退出（符合预期）。\n请重启进程后，用该结算号在第 ③ 步恢复。', 'held');
+  }
+  refreshState();
+}
+async function viewLogs() {
+  const no = document.getElementById('rec-no').value.trim();
+  if (!no) return;
+  const r = await fetch('/api/settlement/' + encodeURIComponent(no));
+  const d = await r.json();
+  const fmt = (rows) => rows.length
+    ? rows.map(x => x.created_at + '  ' + x.event.padEnd(18) + (x.note || '')).join('\n')
+    : '（该库无此结算号的日志）';
+  const a = document.getElementById('log-debit'); a.textContent = fmt(d.debit_log); a.className = '';
+  const b = document.getElementById('log-credit'); b.textContent = fmt(d.credit_log); b.className = '';
+}
+async function recover() {
+  const no = document.getElementById('rec-no').value.trim();
+  const msg = document.getElementById('rec-msg');
+  if (!no) { showMsg(msg, '请填写结算号', 'error'); return; }
+  const r = await fetch('/api/settlement/recover',
+      {method: 'POST', body: new URLSearchParams({settlement_no: no})});
+  const d = await r.json();
+  const res = d.result;
+  const explain = {
+    committed: '已提交：两库预备事务均已 COMMIT PREPARED，扣款与入账各一笔，无重复。',
+    aborted:   '已撤销：按协调日志（无提交决定）对两库执行 ROLLBACK PREPARED，未发生扣款/入账。',
+    held:      '已保留：无法核实协调日志/对端状态，预备事务原样保留，需人工介入。',
+    duplicate: '已拒绝：同一结算号的恢复正在进行中（并发/重复恢复保护）。',
+    noop:      '无动作：查不到该结算号的预备事务或流水。',
+  }[res.status] || res.status;
+  showMsg(msg, '结算 ' + no + ' → 状态【' + res.status + '】\n' + explain +
+      '\n判定依据：' + res.decision_basis + '\n详情：' + JSON.stringify(res.detail), res.status);
+  await viewLogs();
+  refreshState();
+}
+refreshState();
+setInterval(refreshState, 5000);
+</script>
+</body>
+</html>

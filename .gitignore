@@ -1,0 +1,12 @@
+# Local PostgreSQL clusters (Docker-free self-test path via pgserver binaries)
+.local-pg/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.local-setup/
+
+# Logs / scratch
+*.log
+/tmp/

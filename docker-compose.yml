@@ -1,0 +1,71 @@
+# Double-database 2PC drill:
+#   debit-db  - 扣款库 (holds the prepared debit transaction)
+#   credit-db - 入账库 (holds the prepared credit transaction)
+#   ops-web   - FastAPI ops console / coordinator
+#
+# Prepared transactions are disabled by default in PostgreSQL, so every
+# database must set max_prepared_transactions explicitly.
+services:
+  debit-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ops
+      POSTGRES_PASSWORD: ops
+      POSTGRES_DB: billing
+    command:
+      - postgres
+      - -c
+      - max_prepared_transactions=200
+      - -c
+      - listen_addresses=*
+    ports:
+      - "55432:5432"
+    volumes:
+      - debit-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ops -d billing"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  credit-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ops
+      POSTGRES_PASSWORD: ops
+      POSTGRES_DB: billing
+    command:
+      - postgres
+      - -c
+      - max_prepared_transactions=200
+      - -c
+      - listen_addresses=*
+    ports:
+      - "55433:5432"
+    volumes:
+      - credit-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ops -d billing"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ops-web:
+    build: .
+    depends_on:
+      debit-db:
+        condition: service_healthy
+      credit-db:
+        condition: service_healthy
+    environment:
+      DSN_DEBIT: "host=debit-db port=5432 dbname=billing user=ops password=ops"
+      DSN_CREDIT: "host=credit-db port=5432 dbname=billing user=ops password=ops"
+      # none | after_both_prepared | after_one_commit
+      FAILPOINT: "${FAILPOINT:-none}"
+      APP_PORT: "8080"
+    ports:
+      - "8080:8080"
+
+volumes:
+  debit-data:
+  credit-data:
